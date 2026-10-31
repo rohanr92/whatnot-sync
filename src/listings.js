@@ -135,7 +135,11 @@ export async function createListing(d) {
   let pr;
   try { pr = await wn.patchVariants(pid, patches); }
   catch (e) { await wn.deleteProduct(pid).catch(() => {}); throw e; } // undo, so a retry doesn't make a duplicate
-  pr.errors.forEach((e) => warnings.push(`Variant ${e.id}: ${e.message || e.code}`));
+  if (patches.length && !pr.variants.length) {
+    await wn.deleteProduct(pid).catch(() => {});
+    throw new Error('Whatnot rejected every size, nothing was created: ' + JSON.stringify(pr.errors).slice(0, 500));
+  }
+  pr.errors.forEach((e) => warnings.push(`Variant ${e.id}: ${e.message || e.detail || e.code || JSON.stringify(e)}`));
   if (qtys.length) await wn.setInventory(qtys);
 
   // keep local cache in step
@@ -164,12 +168,69 @@ export async function createListing(d) {
       merch = await wn.merchandise(pid, m);
       await q('UPDATE wn_products SET transaction_type=$2, reserved_for_live=$3 WHERE id=$1', [pid, merch.transaction_type, merch.reserved_for_live]);
     } catch (e) {
-      const why = e.body?.errors ? e.body.errors.map((x) => x.field || x.message || JSON.stringify(x)).join(', ') : e.message;
-      warnings.push(`Created as draft — not published: ${why}`);
+      warnings.push(`Created, but NOT published: ${e.message}`);
     }
   }
   await log(warnings.length ? 'warn' : 'info', 'listings', `Created Whatnot product ${pid} "${d.title}" (${wvs.length} variants)${warnings.length ? ' — ' + warnings.join('; ') : ''}`);
   return { product_id: pid, url: created.url, variants: wvs.length, published: !!merch && d.sale_format !== 'auction', warnings };
+}
+
+// Repair Whatnot products that exist but have no price / SKU / stock (e.g. half-created drafts).
+// Finds the Shopify product by exact title, then sets SKU, Shopify id, whole-dollar prices, fields, stock, and publishes.
+export async function repairProducts(ids, o = {}) {
+  const s = await getSettings();
+  const results = [];
+  for (const id of ids) {
+    const r = { id, ok: false, warnings: [] };
+    try {
+      const { rows: [row] } = await q('SELECT title FROM wn_products WHERE id=$1', [id]);
+      const title = row?.title || (await wn.getProduct(id)).title;
+      r.title = title;
+      const found = await shopify.searchProducts([title], 'name', s.location_id);
+      const p = found.find((x) => lc(x.title) === lc(title)) || found[0];
+      if (!p) throw new Error(`No Shopify product named "${title}"`);
+      const d = await buildDraft(p, s);
+      if (d.attributes?.length) {
+        try { await wn.updateProduct(id, { attributes: d.attributes.map((a) => ({ id: String(a.id), value: String(a.value) })) }); }
+        catch (e) { r.warnings.push(`Fields (type/brand/condition) not saved: ${e.message}`); }
+      }
+      const wvs = await wn.allVariants(id);
+      const patches = []; const qtys = [];
+      for (const wv of wvs) {
+        const dv = matchVariant(wv, d.variants);
+        if (!dv) { r.warnings.push(`No Shopify size for ${wv.selected_options?.map((x) => x.value).join('/')}`); continue; }
+        const bin = Number(o.bin) > 0 ? Number(o.bin) : dv.bin;
+        const auc = Number(o.auction) > 0 ? Number(o.auction) : dv.auction;
+        const pricing = {};
+        if (bin > 0) pricing.buy_it_now = { price: { amount: Math.max(1, Math.round(bin)).toFixed(2), currency: 'USD' } };
+        if (auc > 0) pricing.auction = { start_price: { amount: Math.max(1, Math.round(auc)).toFixed(2), currency: 'USD' } };
+        patches.push({ id: wv.id, sku: dv.sku || undefined, external_id: shopify.numId(dv.shopify_variant_id), pricing });
+        qtys.push({ variant_id: wv.id, quantity: dv.qty || 0, sku: dv.sku });
+      }
+      const pr = await wn.patchVariants(id, patches);
+      if (!pr.variants.length) throw new Error('Whatnot rejected the prices: ' + JSON.stringify(pr.errors).slice(0, 500));
+      pr.errors.forEach((e) => r.warnings.push(`Size ${e.id}: ${e.message || e.detail || e.code || JSON.stringify(e)}`));
+      if (qtys.length) await wn.setInventory(qtys);
+      await q('UPDATE wn_products SET shopify_product_id=$2 WHERE id=$1', [id, d.shopify_product_id]);
+      await sync.refreshWhatnotProduct({ id, title, media: d.media }, { merch: false });
+      r.qty = qtys.reduce((a, x) => a + x.quantity, 0);
+      if (o.publish) {
+        try {
+          const m = o.sale_format === 'auction' ? { transaction_type: 'auction' } : { transaction_type: 'buy_it_now', reserve_for_live: false };
+          const mr = await wn.merchandise(id, m);
+          await q('UPDATE wn_products SET transaction_type=$2, reserved_for_live=$3 WHERE id=$1', [id, mr.transaction_type, mr.reserved_for_live]);
+          r.published = true;
+        } catch (e) { r.warnings.push(`Priced and stocked, but NOT published: ${e.message}`); }
+      }
+      r.ok = true;
+    } catch (e) { r.error = e.message; }
+    results.push(r);
+  }
+  await sync.relink();
+  await sync.pushInventory({ reason: 'repair' }).catch(() => {});
+  const ok = results.filter((x) => x.ok).length;
+  await log(ok === ids.length ? 'info' : 'warn', 'listings', `Repaired ${ok}/${ids.length} products` + results.filter((x) => !x.ok || x.warnings.length).map((x) => ` | ${x.title || x.id}: ${x.error || x.warnings.join('; ')}`).join(''));
+  return { repaired: ok, results };
 }
 
 // Re-send Shopify content to an existing Whatnot product

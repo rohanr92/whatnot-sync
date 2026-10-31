@@ -716,10 +716,33 @@ function renderPBulk() {
   if (!n) { $('#pbulk').innerHTML = ''; return; }
   $('#pbulk').innerHTML = `<div class="bulkbar"><b>${n} selected</b><span class="sp"></span>
     <button class="btn sm" id="pbEdit">✎ Bulk edit</button><button class="btn sm" id="pbUpd">⟳ Update from Shopify</button>
-    <button class="btn sm" id="pbFmt">Sale format</button><button class="btn sm" id="pbDel">🗑 Delete</button><button class="btn sm" id="pbClr">✕</button></div>`;
+    <button class="btn sm" id="pbFix">🔧 Fix price & stock</button><button class="btn sm" id="pbFmt">Sale format</button><button class="btn sm" id="pbDel">🗑 Delete</button><button class="btn sm" id="pbClr">✕</button></div>`;
   const ids = [...prod.sel];
   $('#pbClr').onclick = () => { prod.sel.clear(); renderProducts(); };
   $('#pbFmt').onclick = () => { inv.selProducts = new Map(ids.map((id) => [id, id])); bulkFormatModal(); };
+  $('#pbFix').onclick = () => modal(`<h2>Fix price & stock · ${n} products</h2>
+      <p class="muted">For listings on Whatnot with no price or stock. Finds each one in Shopify by name, then sets SKU, sizes, stock from your location, fields and price. Whole dollars only.</p>
+      <div class="grid g2" style="gap:0 12px">
+        <label class="f"><span>Buy it now $ (blank = Shopify price)</span><input type="number" step="1" id="fxb" /></label>
+        <label class="f"><span>Auction start $</span><input type="number" step="1" id="fxa" /></label>
+        <label class="f"><span>Sell as</span><select id="fxs"><option value="buy_it_now">Buy it now</option><option value="auction">Auction</option></select></label>
+        <label class="switch" style="margin-top:22px"><input type="checkbox" id="fxp" checked /> Publish</label>
+      </div>
+      <div id="fxr"></div>
+      <div class="modal-foot"><button class="btn" data-close>Close</button><button class="btn primary" id="fxgo">Fix ${n}</button></div>`, (el) => {
+    $('#fxgo', el).onclick = async () => {
+      const sf = $('#fxs', el).value;
+      if (sf === 'auction' && !$('#fxa', el).value) return toast('Type an Auction start price', 'bad');
+      $('#fxgo', el).disabled = true; $('#fxgo', el).innerHTML = '<span class="spin"></span> Fixing…';
+      try {
+        const r = await api('/products/repair', { method: 'POST', body: { ids, bin: $('#fxb', el).value, auction: $('#fxa', el).value, sale_format: sf, publish: $('#fxp', el).checked } });
+        $('#fxr', el).innerHTML = `<h2 style="margin-top:10px">${r.repaired} of ${ids.length} fixed</h2>` + r.results.map((x) => `<div style="padding:6px 0;border-bottom:1px dashed var(--line);font-size:13px">
+          ${x.ok ? '<span class="result-ok">✓</span>' : '<span class="result-bad">✕</span>'} <b>${esc(x.title || x.id)}</b>${x.ok ? ` · qty ${x.qty}${x.published ? ' · <span class="b ok">published</span>' : ''}` : ''}
+          ${x.error ? `<div class="err">${esc(x.error)}</div>` : ''}${x.warnings?.length ? `<div class="muted">${esc(x.warnings.join(' · '))}</div>` : ''}</div>`).join('');
+        $('#fxgo', el).remove(); prod.sel.clear(); loadProducts();
+      } catch (e) { toast(e.message, 'bad'); $('#fxgo', el).disabled = false; $('#fxgo', el).textContent = 'Fix'; }
+    };
+  });
   $('#pbDel').onclick = async () => {
     if (!confirmBox(`Delete ${n} product(s) from Whatnot? This can't be undone.`)) return;
     try { const r = await api('/products/delete', { method: 'POST', body: { ids } }); toast(`Deleted ${r.deleted}${r.errors.length ? `, ${r.errors.length} failed` : ''}`, r.errors.length ? 'bad' : 'ok'); prod.sel.clear(); loadProducts(); }

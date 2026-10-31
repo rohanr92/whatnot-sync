@@ -348,6 +348,11 @@ app.post('/api/products/bulk-update-from-shopify', wrap(async (req, res) => {
     return { results, updated: results.filter((r) => r.ok).length, failed: results.filter((r) => !r.ok).length };
   }));
 }));
+app.post('/api/products/repair', wrap(async (req, res) => {
+  const { ids, ...o } = req.body || {};
+  if (!ids?.length) throw Object.assign(new Error('Select products first'), { status: 400 });
+  res.json(await listings.repairProducts(ids, o));
+}));
 app.post('/api/products/delete', wrap(async (req, res) => {
   const { ids } = req.body || {};
   if (!ids?.length) throw Object.assign(new Error('Select products first'), { status: 400 });
