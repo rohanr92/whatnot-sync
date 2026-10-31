@@ -474,6 +474,7 @@ async function settings() {
         <option value="off">Do nothing</option></select>
         <small>Only orders after ${s.orders_since ? `<b>${new Date(s.orders_since).toLocaleString()}</b>` : 'the moment you turn this on'} are imported.</small></label>
       <label class="switch"><input type="checkbox" id="trk" ${s.tracking_enabled ? 'checked' : ''} /> When I fulfill in Shopify, send the tracking number to Whatnot</label>
+      <label class="switch"><input type="checkbox" id="psync" ${s.price_sync !== false ? 'checked' : ''} /> When I change a price in Shopify, update the Whatnot Buy it now price</label>
       <p class="muted" style="margin:-6px 0 12px;font-size:12.5px">Needs the Whatnot token to have <span class="mono">write:shipments</span> and your account to be allowed to use your own shipping labels.</p>
       <label class="f"><span>Full re-check every (minutes)</span><input type="number" id="rm" min="5" value="${esc(s.reconcile_minutes)}" /></label>
       <label class="f"><span>Default price rounding</span><select id="rd"><option value="none">Exact</option><option value="99">End in .99</option><option value="whole">Whole dollars</option></select></label>
@@ -578,7 +579,7 @@ async function settings() {
   };
   $('#save').onclick = async () => {
     const body = { buffer: $('#buf').value, match_by: $('#mb').value, push_enabled: $('#push').checked, orders_mode: $('#om').value,
-      reconcile_minutes: $('#rm').value, rounding: $('#rd').value, zero_unmatched: $('#zu').checked, tracking_enabled: $('#trk').checked,
+      reconcile_minutes: $('#rm').value, rounding: $('#rd').value, zero_unmatched: $('#zu').checked, tracking_enabled: $('#trk').checked, price_sync: $('#psync').checked,
       default_category_id: catValue('defcat'), price_source: $('#ps').value, price_markup_pct: $('#mk').value, auction_start_pct: $('#ap').value,
       default_sale_format: $('#sf').value, default_condition: $('#cond').value, dimension_profile_id: $('#dp').value || null, auto_publish: $('#pub').checked,
       default_dims: { length: Number($('#dl').value), width: Number($('#dw').value), height: Number($('#dh').value), unit: 'inch', weight: Number($('#dwt').value), weight_unit: 'ounce' } };

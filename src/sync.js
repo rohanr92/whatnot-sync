@@ -173,10 +173,14 @@ export async function onShopifyInventory(topic, body) {
 
 export async function onShopifyProduct(body) {
   const s = await getSettings();
-  const changed = [];
+  const changed = []; const priceChanged = [];
   for (const v of body.variants || []) {
     const id = v.admin_graphql_api_id || shopify.gid('ProductVariant', v.id);
     const pid = body.admin_graphql_api_id || shopify.gid('Product', body.id);
+    const { rows: [old] } = await q('SELECT price FROM shop_variants WHERE id=$1', [id]);
+    if (old && v.price != null && Number(old.price) !== Number(v.price)) {
+      priceChanged.push({ id, base: Number(s.price_source === 'compare_at' ? v.compare_at_price || v.price : v.price) });
+    }
     const r = await q(`UPDATE shop_variants SET sku=$2, barcode=$3, price=$4, title=$5, product_title=$6, inventory_item_id=$7, product_id=$8 WHERE id=$1`,
       [id, v.sku || null, v.barcode || null, v.price ?? null, v.title, body.title, String(v.inventory_item_id), pid]);
     if (!r.rowCount && s.location_id) {
@@ -190,6 +194,20 @@ export async function onShopifyProduct(body) {
   if (s.push_enabled && changed.length) {
     const ids = await wnIdsForShop(changed);
     if (ids.length) await pushInventory({ wnIds: ids, reason: 'Shopify product update' });
+  }
+  // Shopify price changed -> Whatnot Buy it now price (whole dollars, markup applied, auction price kept)
+  if (s.price_sync !== false && priceChanged.length) {
+    const { rows } = await q(`SELECT w.id, w.auction_price, l.shop_variant_id FROM wn_variants w JOIN links l ON l.wn_variant_id=w.id
+        WHERE l.shop_variant_id = ANY($1)`, [priceChanged.map((x) => x.id)]);
+    const ups = rows.map((r) => {
+      const base = priceChanged.find((x) => x.id === r.shop_variant_id).base;
+      const bin = Math.round(base * (1 + (Number(s.price_markup_pct) || 0) / 100));
+      return bin > 0 ? { id: r.id, bin, auction: r.auction_price != null ? Number(r.auction_price) : null } : null;
+    }).filter(Boolean);
+    if (ups.length) {
+      const res = await applyPrices(ups);
+      await log(res.errors.length ? 'warn' : 'info', 'prices', `Shopify price change "${body.title}" → Whatnot Buy it now updated on ${res.updated} sizes`);
+    }
   }
 }
 
@@ -342,7 +360,7 @@ export async function importOrder(orderId, { force = false } = {}) {
       const input = {
         currency,
         lineItems: resolved.map((r) => r.shop_variant_id
-          ? { variantId: r.shop_variant_id, quantity: r.quantity, priceSet: money(r.unit_price, currency) }
+          ? { variantId: r.shop_variant_id, quantity: r.quantity, priceSet: money(r.unit_price, currency), requiresShipping: true, sku: r.sku || undefined }
           : { title: `${r.title}${r.sku ? ` (${r.sku})` : ''}`, quantity: r.quantity, priceSet: money(r.unit_price, currency), requiresShipping: true }),
         financialStatus: 'PAID',
         sourceName: 'whatnot',

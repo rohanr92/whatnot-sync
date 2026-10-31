@@ -61,6 +61,7 @@ export const DEFAULT_SETTINGS = {
   rounding: 'none',
   zero_unmatched: false,     // set Whatnot qty to 0 for variants with no Shopify match
   tracking_enabled: true,     // Shopify fulfillment -> Whatnot tracking code
+  price_sync: true,           // Shopify price change -> Whatnot Buy it now price (auction untouched)
   // ---- listing defaults (Shopify -> new Whatnot products) ----
   default_category_id: null,
   category_map: {},           // { "shopify product type (lowercase)": whatnot category id }
