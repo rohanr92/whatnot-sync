@@ -59,11 +59,11 @@ export async function refreshWhatnot(progress = () => {}) {
 
 async function upsertShopVariant(v, level) {
   const qty = level ? (level.quantities?.[0]?.quantity ?? 0) : null;
-  await q(`INSERT INTO shop_variants(id,product_title,title,sku,barcode,price,inventory_item_id,qty,stocked,updated_at)
-    VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,now())
-    ON CONFLICT(id) DO UPDATE SET product_title=$2,title=$3,sku=$4,barcode=$5,price=$6,inventory_item_id=$7,qty=$8,stocked=$9,updated_at=now()`,
+  await q(`INSERT INTO shop_variants(id,product_title,title,sku,barcode,price,inventory_item_id,qty,stocked,product_id,updated_at)
+    VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,now())
+    ON CONFLICT(id) DO UPDATE SET product_title=$2,title=$3,sku=$4,barcode=$5,price=$6,inventory_item_id=$7,qty=$8,stocked=$9,product_id=$10,updated_at=now()`,
   [v.id, v.product?.title, v.title, v.sku || null, v.barcode || null, v.price ?? null,
-    shopify.numId(v.inventoryItem?.id), qty, !!level]);
+    shopify.numId(v.inventoryItem?.id), qty, !!level, v.product?.id || null]);
 }
 
 export async function refreshShopify(progress = () => {}) {
@@ -176,12 +176,13 @@ export async function onShopifyProduct(body) {
   const changed = [];
   for (const v of body.variants || []) {
     const id = v.admin_graphql_api_id || shopify.gid('ProductVariant', v.id);
-    const r = await q(`UPDATE shop_variants SET sku=$2, barcode=$3, price=$4, title=$5, product_title=$6, inventory_item_id=$7 WHERE id=$1`,
-      [id, v.sku || null, v.barcode || null, v.price ?? null, v.title, body.title, String(v.inventory_item_id)]);
+    const pid = body.admin_graphql_api_id || shopify.gid('Product', body.id);
+    const r = await q(`UPDATE shop_variants SET sku=$2, barcode=$3, price=$4, title=$5, product_title=$6, inventory_item_id=$7, product_id=$8 WHERE id=$1`,
+      [id, v.sku || null, v.barcode || null, v.price ?? null, v.title, body.title, String(v.inventory_item_id), pid]);
     if (!r.rowCount && s.location_id) {
       const [lvl] = await shopify.levelsFor([v.inventory_item_id], s.location_id);
-      await q(`INSERT INTO shop_variants(id,product_title,title,sku,barcode,price,inventory_item_id,qty,stocked) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)
-        ON CONFLICT(id) DO NOTHING`, [id, body.title, v.title, v.sku || null, v.barcode || null, v.price ?? null, String(v.inventory_item_id), lvl?.qty ?? null, !!lvl?.stocked]);
+      await q(`INSERT INTO shop_variants(id,product_title,title,sku,barcode,price,inventory_item_id,qty,stocked,product_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+        ON CONFLICT(id) DO NOTHING`, [id, body.title, v.title, v.sku || null, v.barcode || null, v.price ?? null, String(v.inventory_item_id), lvl?.qty ?? null, !!lvl?.stocked, pid]);
     }
     changed.push(id);
   }
@@ -404,6 +405,61 @@ export async function cancelImported(orderId, wnStatus) {
   }
   await q(`UPDATE orders SET status='cancelled', wn_status=$2, updated_at=now() WHERE wn_order_id=$1`, [orderId, wnStatus]);
   await log('info', 'orders', `Whatnot order ${orderId} cancelled → ${row.shopify_order_name || ''} cancelled${row.deducted ? ', stock returned' : ''}`);
+}
+
+// ---------- fulfillment: Shopify tracking -> Whatnot ----------
+export function mapCarrier(company) {
+  const c = String(company || '').toLowerCase();
+  if (c.includes('usps')) return 'usps';
+  if (/\bups\b|^ups/.test(c)) return 'ups';
+  if (c.includes('fedex')) return 'fedex';
+  if (c.includes('dhl')) return 'dhl';
+  if (c.includes('canada post')) return 'canada_post';
+  return c.replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '') || 'usps';
+}
+
+export async function sendTracking(orderId, { carrier, tracking_code, item_ids = null, source = 'manual' }) {
+  const { rows: [row] } = await q('SELECT * FROM orders WHERE wn_order_id=$1', [orderId]);
+  if (!row) throw new Error('Order not found');
+  const ids = (item_ids?.length ? item_ids : (row.items || []).map((i) => i.wn_item_id)).filter(Boolean).map(String);
+  if (!ids.length) throw new Error('No Whatnot order items to attach tracking to');
+  const tracking = row.tracking || {};
+  const key = `${carrier}:${tracking_code}`;
+  if (tracking[key] && ids.every((i) => tracking[key].items.includes(i))) return { skipped: 'already sent' };
+  try {
+    await wn.addTrackingCode(carrier, ids, tracking_code);
+    tracking[key] = { carrier, tracking_code, items: ids, sent_at: new Date().toISOString(), source };
+    await q(`UPDATE orders SET tracking=$2, tracking_status='sent', tracking_error=NULL, updated_at=now() WHERE wn_order_id=$1`, [orderId, JSON.stringify(tracking)]);
+    await log('info', 'tracking', `Whatnot order ${orderId}: sent ${carrier} ${tracking_code} (${ids.length} item${ids.length > 1 ? 's' : ''})`);
+    return { sent: true, items: ids.length };
+  } catch (e) {
+    const msg = e.status === 503 ? 'Whatnot says seller tracking codes are unavailable for this account (own-label shipping not enabled)'
+      : e.status === 409 ? 'Whatnot refused this tracking code for these items (already shipped/dropped off, or a different buyer/address)' : e.message;
+    await q(`UPDATE orders SET tracking_status='error', tracking_error=$2, updated_at=now() WHERE wn_order_id=$1`, [orderId, msg]);
+    await log('error', 'tracking', `Whatnot order ${orderId}: ${msg}`);
+    throw new Error(msg);
+  }
+}
+
+export async function onShopifyFulfillment(body) {
+  const s = await getSettings();
+  if (!s.tracking_enabled) return;
+  if (['cancelled', 'error', 'failure'].includes(body.status)) return;
+  const orderGid = shopify.gid('Order', body.order_id);
+  const { rows: [row] } = await q('SELECT * FROM orders WHERE shopify_order_id=$1', [orderGid]);
+  if (!row) return; // not a Whatnot order
+  const code = body.tracking_number || body.tracking_numbers?.[0];
+  if (!code) { await log('info', 'tracking', `Shopify fulfilled ${row.shopify_order_name} without a tracking number — nothing sent`); return; }
+  const items = row.items || [];
+  const ids = new Set();
+  for (const li of body.line_items || []) {
+    const vg = li.variant_id ? shopify.gid('ProductVariant', li.variant_id) : null;
+    const hit = items.find((i) => vg && i.shop_variant_id === vg) || items.find((i) => !i.shop_variant_id && li.title && li.title.startsWith(i.title));
+    if (hit) ids.add(String(hit.wn_item_id));
+  }
+  if (!ids.size) items.forEach((i) => ids.add(String(i.wn_item_id)));
+  try { await sendTracking(row.wn_order_id, { carrier: mapCarrier(body.tracking_company), tracking_code: code, item_ids: [...ids], source: 'shopify' }); }
+  catch { /* logged */ }
 }
 
 export async function onWhatnotEvent(evt) {

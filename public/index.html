@@ -10,9 +10,11 @@
   <div id="login" class="login hidden">
     <form id="loginForm" class="card login-card">
       <div class="brand big"><span class="logo">W</span><span>Whatnot Sync</span></div>
-      <p class="muted">Enter the app password.</p>
+      <p class="muted" id="loginIntro">Log in to continue.</p>
+      <input type="text" id="lname" placeholder="Your name" class="hidden" autocomplete="name" />
+      <input type="email" id="lemail" placeholder="Email" autocomplete="username" required />
       <input type="password" id="pw" placeholder="Password" autocomplete="current-password" required />
-      <button class="btn primary block" type="submit">Log in</button>
+      <button class="btn primary block" type="submit" id="loginBtn">Log in</button>
       <p id="loginErr" class="err"></p>
     </form>
   </div>
@@ -22,13 +24,16 @@
       <div class="brand"><span class="logo">W</span><span>Whatnot Sync</span></div>
       <nav id="nav">
         <a href="#/" data-v="dash"><i>◎</i><span>Dashboard</span></a>
+        <a href="#/products" data-v="products"><i>◫</i><span>Products</span></a>
         <a href="#/inventory" data-v="inventory"><i>▦</i><span>Inventory</span></a>
+        <a href="#/import" data-v="import"><i>⇪</i><span>Import</span></a>
         <a href="#/orders" data-v="orders"><i>⇣</i><span>Orders</span></a>
         <a href="#/settings" data-v="settings"><i>⚙</i><span>Settings</span></a>
         <a href="#/logs" data-v="logs"><i>☰</i><span>Activity</span></a>
       </nav>
       <div class="side-foot">
         <div id="locBadge" class="loc-badge"></div>
+        <div id="userBadge" class="loc-badge"></div>
         <button id="logout" class="link-btn">Log out</button>
       </div>
     </aside>

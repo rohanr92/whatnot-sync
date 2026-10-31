@@ -71,7 +71,7 @@ export async function* variantsAtLocation(locationId) {
     const d = await gql(`query($after:String,$loc:ID!){
       productVariants(first: 100, after: $after) {
         pageInfo { hasNextPage endCursor }
-        nodes { id title sku barcode price product { title }
+        nodes { id title sku barcode price product { id title }
           inventoryItem { id inventoryLevel(locationId: $loc) { quantities(names: ["available"]) { name quantity } } } }
       } }`, { after, loc: locationId });
     yield d.productVariants.nodes;
@@ -124,7 +124,61 @@ export async function cancelOrder(orderId, note) {
 
 export const WEBHOOK_TOPICS = [
   'INVENTORY_LEVELS_UPDATE', 'INVENTORY_LEVELS_CONNECT', 'INVENTORY_LEVELS_DISCONNECT', 'PRODUCTS_UPDATE',
+  'FULFILLMENTS_CREATE', 'FULFILLMENTS_UPDATE',
 ];
+
+// ---------- products (import to Whatnot) ----------
+const PRODUCT_FIELDS = `id title handle status vendor productType descriptionHtml tags
+  options { name values }
+  media(first: 10) { nodes { ... on MediaImage { image { url altText } } } }
+  variants(first: 100) { nodes { id title sku barcode price compareAtPrice selectedOptions { name value }
+    inventoryItem { id inventoryLevel(locationId: $loc) { quantities(names: ["available"]) { quantity } } } } }`;
+
+function shapeProduct(p) {
+  return {
+    id: p.id, title: p.title, handle: p.handle, status: p.status, vendor: p.vendor, productType: p.productType,
+    descriptionHtml: p.descriptionHtml, tags: p.tags, options: p.options,
+    images: (p.media?.nodes || []).map((m) => m?.image).filter(Boolean).map((i) => ({ url: i.url, alt: i.altText || '' })),
+    variants: (p.variants?.nodes || []).map((v) => ({
+      id: v.id, title: v.title, sku: v.sku, barcode: v.barcode, price: v.price, compareAtPrice: v.compareAtPrice,
+      selectedOptions: v.selectedOptions, inventory_item_id: numId(v.inventoryItem?.id),
+      stocked: !!v.inventoryItem?.inventoryLevel, qty: v.inventoryItem?.inventoryLevel?.quantities?.[0]?.quantity ?? null,
+    })),
+  };
+}
+
+const escQ = (t) => String(t).replace(/["\\]/g, ' ').trim();
+
+// mode: any | name | sku | upc. terms: one or many (bulk paste)
+export async function searchProducts(terms, mode, locationId) {
+  const list = (Array.isArray(terms) ? terms : [terms]).map((t) => String(t).trim()).filter(Boolean).slice(0, 200);
+  const found = new Map();
+  for (const t of list) {
+    let ids = [];
+    if (mode === 'sku' || mode === 'upc') {
+      const field = mode === 'sku' ? 'sku' : 'barcode';
+      const d = await gql(`query($q:String!){ productVariants(first: 50, query: $q) { nodes { product { id } } } }`, { q: `${field}:"${escQ(t)}"` });
+      ids = d.productVariants.nodes.map((n) => n.product.id);
+    } else {
+      const query = mode === 'name' ? `title:*${escQ(t)}*` : escQ(t);
+      const d = await gql(`query($q:String!){ products(first: 50, query: $q) { nodes { id } } }`, { q: query });
+      ids = d.products.nodes.map((n) => n.id);
+    }
+    for (const id of ids) found.set(id, t);
+  }
+  const ids = [...found.keys()].slice(0, 100);
+  const out = [];
+  for (let i = 0; i < ids.length; i += 10) {
+    const d = await gql(`query($ids:[ID!]!, $loc: ID!){ nodes(ids: $ids) { ... on Product { ${PRODUCT_FIELDS} } } }`, { ids: ids.slice(i, i + 10), loc: locationId });
+    out.push(...d.nodes.filter(Boolean).map(shapeProduct));
+  }
+  return out;
+}
+
+export async function getProduct(id, locationId) {
+  const d = await gql(`query($id: ID!, $loc: ID!){ product(id: $id) { ${PRODUCT_FIELDS} } }`, { id: gid('Product', id), loc: locationId });
+  return d.product ? shapeProduct(d.product) : null;
+}
 
 export async function registerWebhooks(appUrl) {
   const uri = `${appUrl.replace(/\/$/, '')}/webhooks/shopify`;

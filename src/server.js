@@ -6,13 +6,14 @@ import { migrate, q, getSettings, saveSettings, log, firstTime } from './db.js';
 import * as shopify from './shopify.js';
 import * as wn from './whatnot.js';
 import * as sync from './sync.js';
+import * as auth from './auth.js';
+import * as tax from './taxonomy.js';
+import * as listings from './listings.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
 app.set('trust proxy', 1);
 const PORT = process.env.PORT || 3000;
-const PASSWORD = process.env.APP_PASSWORD || '';
-const SESSION_SECRET = process.env.SESSION_SECRET || crypto.createHash('sha256').update('wns:' + PASSWORD + (process.env.WHATNOT_API_KEY || '')).digest('hex');
 const appUrl = (req) => (process.env.APP_URL || `${req.protocol}://${req.get('host')}`).replace(/\/$/, '');
 
 // ---------- webhooks (raw body, before JSON parser) ----------
@@ -30,6 +31,7 @@ app.post('/webhooks/shopify', raw, async (req, res) => {
     const body = JSON.parse(req.body.toString('utf8'));
     if (topic?.startsWith('inventory_levels/')) await sync.onShopifyInventory(topic, body);
     else if (topic === 'products/update') await sync.onShopifyProduct(body);
+    else if (topic?.startsWith('fulfillments/')) await sync.onShopifyFulfillment(body);
   } catch (e) { await log('error', 'webhook', `Shopify ${topic}: ${e.message}`); }
 });
 
@@ -47,43 +49,72 @@ app.post('/webhooks/whatnot', raw, async (req, res) => {
 
 app.get('/healthz', (_req, res) => res.json({ ok: true }));
 
-// ---------- auth ----------
-app.use(express.json({ limit: '2mb' }));
-const sign = (v) => crypto.createHmac('sha256', SESSION_SECRET).update(v).digest('hex');
-function readCookie(req, name) {
-  const c = (req.headers.cookie || '').split(';').map((x) => x.trim()).find((x) => x.startsWith(name + '='));
-  return c ? decodeURIComponent(c.slice(name.length + 1)) : null;
-}
-function authed(req) {
-  if (!PASSWORD) return true;
-  const c = readCookie(req, 'wns');
-  if (!c) return false;
-  const [exp, sig] = c.split('.');
-  return sig && sig === sign(exp) && Number(exp) > Date.now();
-}
-app.post('/api/login', (req, res) => {
-  const ok = PASSWORD && typeof req.body?.password === 'string' &&
-    crypto.timingSafeEqual(crypto.createHash('sha256').update(req.body.password).digest(), crypto.createHash('sha256').update(PASSWORD).digest());
-  if (!ok) return res.status(401).json({ error: 'Wrong password' });
-  const exp = String(Date.now() + 30 * 864e5);
-  res.setHeader('Set-Cookie', `wns=${exp}.${sign(exp)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${30 * 86400}${req.secure ? '; Secure' : ''}`);
-  res.json({ ok: true });
-});
-app.post('/api/logout', (_req, res) => { res.setHeader('Set-Cookie', 'wns=; Path=/; Max-Age=0'); res.json({ ok: true }); });
-app.get('/api/me', (req, res) => res.json({ authed: authed(req), passwordSet: !!PASSWORD }));
-app.use('/api', (req, res, next) => (authed(req) ? next() : res.status(401).json({ error: 'Login required' })));
-
-const wrap = (fn) => (req, res) => Promise.resolve(fn(req, res)).catch((e) => {
+// ---------- auth (user accounts) ----------
+app.use(express.json({ limit: '5mb' }));
+const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch((e) => {
   console.error(e); res.status(e.status && e.status < 600 ? (e.status === 401 ? 502 : e.status) : 500).json({ error: e.message });
 });
+
+app.get('/api/me', wrap(async (req, res) => {
+  const user = await auth.currentUser(req);
+  res.json({ user, needsSetup: !user && (await auth.userCount()) === 0 });
+}));
+app.post('/api/setup', wrap(async (req, res) => {
+  if ((await auth.userCount()) > 0) return res.status(403).json({ error: 'Setup already done — log in instead' });
+  const u = await auth.createUser({ ...req.body, role: 'admin' });
+  await auth.startSession(res, req, u.id);
+  await log('info', 'auth', `Admin account created: ${u.email}`);
+  res.json({ user: u });
+}));
+app.post('/api/login', wrap(async (req, res) => {
+  const email = String(req.body?.email || '').toLowerCase().trim();
+  const key = `${req.ip}|${email}`;
+  if (auth.tooManyAttempts(key)) return res.status(429).json({ error: 'Too many attempts — try again in 15 minutes' });
+  const { rows: [u] } = await q('SELECT * FROM users WHERE email=$1', [email]);
+  if (!u || !(await auth.checkPassword(String(req.body?.password || ''), u.password_hash))) {
+    auth.recordFail(key); return res.status(401).json({ error: 'Wrong email or password' });
+  }
+  auth.clearFails(key);
+  await auth.startSession(res, req, u.id);
+  res.json({ user: { id: u.id, email: u.email, name: u.name, role: u.role } });
+}));
+app.post('/api/logout', wrap(async (req, res) => { await auth.endSession(req, res); res.json({ ok: true }); }));
+app.use('/api', wrap(async (req, res, next) => {
+  const u = await auth.currentUser(req);
+  if (!u) return res.status(401).json({ error: 'Login required' });
+  req.user = u; next();
+}));
+const adminOnly = (req, res, next) => (req.user?.role === 'admin' ? next() : res.status(403).json({ error: 'Admins only' }));
+
+app.post('/api/me/password', wrap(async (req, res) => {
+  const { current, password } = req.body || {};
+  const { rows: [u] } = await q('SELECT * FROM users WHERE id=$1', [req.user.id]);
+  if (!(await auth.checkPassword(String(current || ''), u.password_hash))) return res.status(400).json({ error: 'Current password is wrong' });
+  if (String(password || '').length < 8) return res.status(400).json({ error: 'New password must be at least 8 characters' });
+  await q('UPDATE users SET password_hash=$2 WHERE id=$1', [u.id, await auth.hashPassword(password)]);
+  res.json({ ok: true });
+}));
+app.get('/api/users', adminOnly, wrap(async (_req, res) => {
+  res.json((await q('SELECT id,email,name,role,created_at,last_login FROM users ORDER BY id')).rows);
+}));
+app.post('/api/users', adminOnly, wrap(async (req, res) => {
+  const u = await auth.createUser(req.body || {});
+  await log('info', 'auth', `${req.user.email} added user ${u.email} (${u.role})`);
+  res.json(u);
+}));
+app.delete('/api/users/:id', adminOnly, wrap(async (req, res) => {
+  if (String(req.params.id) === String(req.user.id)) return res.status(400).json({ error: "You can't remove yourself" });
+  await q('DELETE FROM users WHERE id=$1', [req.params.id]);
+  res.json({ ok: true });
+}));
 
 // ---------- status & settings ----------
 app.get('/api/status', wrap(async (req, res) => {
   const s = await getSettings();
-  const out = { settings: s, app_url: appUrl(req), env: {
+  const out = { settings: s, user: req.user, app_url: appUrl(req), env: {
     shopify: !!process.env.SHOPIFY_SHOP && !!(process.env.SHOPIFY_ACCESS_TOKEN || process.env.SHOPIFY_CLIENT_ID),
     shopify_webhook_secret: !!(process.env.SHOPIFY_WEBHOOK_SECRET || process.env.SHOPIFY_CLIENT_SECRET || process.env.SHOPIFY_API_SECRET),
-    whatnot: !!process.env.WHATNOT_API_KEY, whatnot_webhook_secret: !!process.env.WHATNOT_WEBHOOK_SECRET, password: !!PASSWORD,
+    whatnot: !!process.env.WHATNOT_API_KEY, whatnot_webhook_secret: !!process.env.WHATNOT_WEBHOOK_SECRET,
   } };
   const [counts] = (await q(`SELECT
       (SELECT count(*) FROM wn_variants)::int AS wn_variants,
@@ -117,7 +148,11 @@ app.post('/api/settings', wrap(async (req, res) => {
     if (!loc) throw Object.assign(new Error('Location not found'), { status: 400 });
     patch.location_name = loc.name;
   }
-  for (const k of ['match_by', 'push_enabled', 'orders_mode', 'reconcile_minutes', 'rounding', 'zero_unmatched']) if (b[k] !== undefined) patch[k] = b[k];
+  for (const k of ['match_by', 'push_enabled', 'orders_mode', 'reconcile_minutes', 'rounding', 'zero_unmatched', 'tracking_enabled',
+    'default_category_id', 'category_map', 'dimension_profile_id', 'default_dims', 'default_condition', 'price_source',
+    'price_markup_pct', 'auction_start_pct', 'default_sale_format', 'auto_publish']) if (b[k] !== undefined) patch[k] = b[k];
+  if (b.price_markup_pct !== undefined) patch.price_markup_pct = Number(b.price_markup_pct) || 0;
+  if (b.auction_start_pct !== undefined) patch.auction_start_pct = b.auction_start_pct === '' || b.auction_start_pct === null ? null : Number(b.auction_start_pct);
   if (b.buffer !== undefined) patch.buffer = Math.max(0, parseInt(b.buffer, 10) || 0);
   if (b.reconcile_minutes !== undefined) patch.reconcile_minutes = Math.max(5, parseInt(b.reconcile_minutes, 10) || 15);
   const before = await getSettings();
@@ -224,7 +259,107 @@ app.post('/api/products/merch', wrap(async (req, res) => {
   res.json(await sync.bulkMerch({ productIds: product_ids, transaction_type, reserve_for_live }));
 }));
 
+// ---------- categories & shipping profiles ----------
+app.get('/api/categories', wrap(async (req, res) => {
+  const qs = String(req.query.search || '').toLowerCase();
+  const list = await tax.categories();
+  res.json(qs ? list.filter((c) => c.path.toLowerCase().includes(qs)).slice(0, 60) : list);
+}));
+app.get('/api/categories/:id', wrap(async (req, res) => {
+  const c = await tax.categoryInfo(req.params.id);
+  if (!c) return res.status(404).json({ error: 'Category not found' });
+  res.json(c);
+}));
+app.get('/api/dimension-profiles', wrap(async (_req, res) => res.json(await wn.dimensionProfiles())));
+
+// ---------- Shopify import -> Whatnot listings ----------
+app.get('/api/shopify/search', wrap(async (req, res) => {
+  const s = await getSettings();
+  if (!s.location_id) throw Object.assign(new Error('Pick a Shopify location in Settings first'), { status: 400 });
+  const raw = String(req.query.q || '').trim();
+  if (!raw) return res.json([]);
+  const terms = raw.split(/[\n,;\t]+/).map((t) => t.trim()).filter(Boolean);
+  const products = await shopify.searchProducts(terms, req.query.mode || 'any', s.location_id);
+  const on = await listings.onWhatnot(products.map((p) => p.id));
+  res.json(products.map((p) => ({ ...p, wn_product_id: on[p.id] || null })));
+}));
+app.post('/api/import/preview', wrap(async (req, res) => {
+  const { ids, overrides } = req.body || {};
+  if (!ids?.length) throw Object.assign(new Error('Select products first'), { status: 400 });
+  res.json(await listings.previewImport(ids.slice(0, 50), overrides || {}));
+}));
+app.post('/api/import/create', wrap(async (req, res) => {
+  const drafts = req.body?.drafts || [];
+  if (!drafts.length) throw Object.assign(new Error('Nothing to create'), { status: 400 });
+  res.json(sync.runJob('import', async (progress) => {
+    const results = [];
+    for (const [i, d] of drafts.entries()) {
+      progress(`Creating ${i + 1} of ${drafts.length}: ${d.title}`);
+      try { results.push({ title: d.title, ok: true, ...(await listings.createListing(d)) }); }
+      catch (e) {
+        const msg = e.body?.errors ? e.body.errors.map((x) => `${x.field || ''} ${x.message || ''}`.trim()).join('; ') : e.message;
+        results.push({ title: d.title, ok: false, error: msg });
+        await log('error', 'listings', `Create "${d.title}" failed: ${msg}`);
+      }
+    }
+    return { results, created: results.filter((r) => r.ok).length, failed: results.filter((r) => !r.ok).length };
+  }));
+}));
+
+// ---------- Whatnot products ----------
+app.get('/api/products', wrap(async (req, res) => {
+  const search = String(req.query.search || '').toLowerCase();
+  const lim = Math.min(200, Number(req.query.limit) || 50), off = (Math.max(1, Number(req.query.page) || 1) - 1) * lim;
+  const where = search ? `WHERE lower(p.title) LIKE $1 OR EXISTS (SELECT 1 FROM wn_variants x WHERE x.product_id=p.id AND lower(coalesce(x.sku,'')) LIKE $1)` : '';
+  const params = search ? [`%${search}%`] : [];
+  const { rows } = await q(`SELECT p.*, count(w.id)::int AS variants, sum(coalesce(w.wn_qty,0))::int AS qty,
+      min(w.bin_price) AS min_bin, max(w.bin_price) AS max_bin, min(w.auction_price) AS min_auction,
+      count(l.wn_variant_id)::int AS linked
+      FROM wn_products p LEFT JOIN wn_variants w ON w.product_id=p.id LEFT JOIN links l ON l.wn_variant_id=w.id
+      ${where} GROUP BY p.id ORDER BY p.title LIMIT ${lim} OFFSET ${off}`, params);
+  const { rows: [{ n }] } = await q(`SELECT count(*)::int AS n FROM wn_products p ${where}`, params);
+  res.json({ rows, total: n });
+}));
+app.get('/api/products/:id', wrap(async (req, res) => {
+  const p = await wn.getProduct(req.params.id);
+  const category = p.category?.id ? await tax.categoryInfo(p.category.id) : null;
+  const { rows: variants } = await q(`SELECT w.*, sv.sku AS shop_sku, sv.qty AS shop_qty, sv.stocked FROM wn_variants w
+      LEFT JOIN links l ON l.wn_variant_id=w.id LEFT JOIN shop_variants sv ON sv.id=l.shop_variant_id WHERE w.product_id=$1 ORDER BY w.options`, [req.params.id]);
+  const { rows: [local] } = await q('SELECT shopify_product_id, transaction_type, reserved_for_live FROM wn_products WHERE id=$1', [req.params.id]);
+  res.json({ product: p, category, variants, local: local || {} });
+}));
+app.patch('/api/products/:id', wrap(async (req, res) => res.json(await listings.editProduct(req.params.id, req.body || {}))));
+app.post('/api/products/:id/update-from-shopify', wrap(async (req, res) => res.json(await listings.updateFromShopify(req.params.id, req.body || {}))));
+app.post('/api/products/bulk-edit', wrap(async (req, res) => {
+  const { ids, changes } = req.body || {};
+  if (!ids?.length) throw Object.assign(new Error('Select products first'), { status: 400 });
+  res.json(await listings.bulkEditProducts(ids, changes || {}));
+}));
+app.post('/api/products/bulk-update-from-shopify', wrap(async (req, res) => {
+  const { ids, prices } = req.body || {};
+  if (!ids?.length) throw Object.assign(new Error('Select products first'), { status: 400 });
+  res.json(sync.runJob('update', async (progress) => {
+    const results = [];
+    for (const [i, id] of ids.entries()) {
+      progress(`Updating ${i + 1} of ${ids.length}`);
+      try { results.push({ id, ok: true, ...(await listings.updateFromShopify(id, { prices: !!prices })) }); }
+      catch (e) { results.push({ id, ok: false, error: e.message }); }
+    }
+    return { results, updated: results.filter((r) => r.ok).length, failed: results.filter((r) => !r.ok).length };
+  }));
+}));
+app.post('/api/products/delete', wrap(async (req, res) => {
+  const { ids } = req.body || {};
+  if (!ids?.length) throw Object.assign(new Error('Select products first'), { status: 400 });
+  res.json(await listings.deleteProducts(ids));
+}));
+
 // ---------- orders & logs ----------
+app.post('/api/orders/:id/tracking', wrap(async (req, res) => {
+  const { carrier, tracking_code } = req.body || {};
+  if (!carrier || !tracking_code) throw Object.assign(new Error('Carrier and tracking number are required'), { status: 400 });
+  res.json(await sync.sendTracking(req.params.id, { carrier: sync.mapCarrier(carrier), tracking_code: String(tracking_code).trim() }));
+}));
 app.get('/api/orders', wrap(async (req, res) => {
   const { rows } = await q(`SELECT * FROM orders ORDER BY coalesce(wn_created_at, created_at) DESC LIMIT $1`, [Math.min(500, Number(req.query.limit) || 100)]);
   res.json(rows);
@@ -254,5 +389,7 @@ async function scheduleReconcile() {
 }
 
 await migrate();
+await auth.bootstrapAdmin();
 await scheduleReconcile();
+tax.loadTaxonomy().catch((e) => console.error(e.message));
 app.listen(PORT, () => console.log(`Whatnot ⇄ Shopify sync running on :${PORT}`));

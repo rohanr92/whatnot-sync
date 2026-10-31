@@ -32,6 +32,20 @@ export async function migrate() {
     wn_created_at TIMESTAMPTZ, created_at TIMESTAMPTZ DEFAULT now(), updated_at TIMESTAMPTZ DEFAULT now());
   CREATE TABLE IF NOT EXISTS events (id TEXT PRIMARY KEY, source TEXT, created_at TIMESTAMPTZ DEFAULT now());
   CREATE TABLE IF NOT EXISTS logs (id BIGSERIAL PRIMARY KEY, level TEXT, area TEXT, message TEXT, created_at TIMESTAMPTZ DEFAULT now());
+  CREATE TABLE IF NOT EXISTS users (
+    id BIGSERIAL PRIMARY KEY, email TEXT UNIQUE NOT NULL, name TEXT, password_hash TEXT NOT NULL,
+    role TEXT DEFAULT 'staff', created_at TIMESTAMPTZ DEFAULT now(), last_login TIMESTAMPTZ);
+  CREATE TABLE IF NOT EXISTS sessions (
+    token_hash TEXT PRIMARY KEY, user_id BIGINT REFERENCES users(id) ON DELETE CASCADE,
+    expires_at TIMESTAMPTZ NOT NULL, created_at TIMESTAMPTZ DEFAULT now());
+  CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value JSONB, updated_at TIMESTAMPTZ DEFAULT now());
+  ALTER TABLE orders ADD COLUMN IF NOT EXISTS tracking JSONB;
+  ALTER TABLE orders ADD COLUMN IF NOT EXISTS tracking_status TEXT;
+  ALTER TABLE orders ADD COLUMN IF NOT EXISTS tracking_error TEXT;
+  ALTER TABLE wn_products ADD COLUMN IF NOT EXISTS shopify_product_id TEXT;
+  ALTER TABLE shop_variants ADD COLUMN IF NOT EXISTS product_id TEXT;
+  ALTER TABLE wn_products ADD COLUMN IF NOT EXISTS category_id TEXT;
+  ALTER TABLE wn_products ADD COLUMN IF NOT EXISTS category_label TEXT;
   `);
 }
 
@@ -46,6 +60,18 @@ export const DEFAULT_SETTINGS = {
   reconcile_minutes: 15,
   rounding: 'none',
   zero_unmatched: false,     // set Whatnot qty to 0 for variants with no Shopify match
+  tracking_enabled: true,     // Shopify fulfillment -> Whatnot tracking code
+  // ---- listing defaults (Shopify -> new Whatnot products) ----
+  default_category_id: null,
+  category_map: {},           // { "shopify product type (lowercase)": whatnot category id }
+  dimension_profile_id: null, // seller dimension profile on Whatnot (optional)
+  default_dims: { length: 12, width: 8, height: 5, unit: 'inch', weight: 32, weight_unit: 'ounce' },
+  default_condition: 'New With Tags',
+  price_source: 'price',      // price | compare_at
+  price_markup_pct: 0,        // Whatnot BIN = Shopify price * (1 + markup%)
+  auction_start_pct: null,    // e.g. 50 => auction start = 50% of BIN; null = no auction price
+  default_sale_format: 'buy_it_now', // buy_it_now | auction
+  auto_publish: false,        // publish to profile shop after create
 };
 
 export async function getSettings() {

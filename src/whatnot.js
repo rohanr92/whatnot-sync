@@ -67,6 +67,22 @@ export async function getOrderItems(id) {
 }
 export const recentOrders = () => api('GET', '/orders?limit=50&reverse=true');
 
+// products
+export const getProduct = (id) => api('GET', `/products/${id}`);
+export const createProduct = (body) => api('POST', '/products', body);
+export const updateProduct = (id, body) => api('PATCH', `/products/${id}`, body);
+export const deleteProduct = (id) => api('DELETE', `/products/${id}`);
+export async function allVariants(productId) {
+  const all = []; for await (const page of listVariants(productId)) all.push(...page); return all;
+}
+export async function dimensionProfiles() {
+  const all = []; for await (const page of paginate('/shipping/dimension_profiles')) all.push(...page); return all;
+}
+
+// shipments: send seller tracking for order items (needs write:shipments + own-label approval)
+export const addTrackingCode = (carrier, orderItemIds, trackingCode) =>
+  api('POST', '/shipments/add_tracking_code', { carrier, order_item_ids: orderItemIds.map(String), tracking_code: trackingCode });
+
 // items: [{variant_id, quantity}] -> chunks of 10 (API limit)
 export async function setInventory(items) {
   const results = [];
