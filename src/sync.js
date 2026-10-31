@@ -247,8 +247,8 @@ export async function applyPrices(updates) {
     const m = meta.get(u.id); if (!m) continue;
     const cur = m.currency || 'USD';
     const pricing = {};
-    if (u.bin != null) pricing.buy_it_now = { price: { amount: Number(u.bin).toFixed(2), currency: cur } };
-    if (u.auction != null) pricing.auction = { start_price: { amount: Number(u.auction).toFixed(2), currency: cur } };
+    if (u.bin != null) pricing.buy_it_now = { price: { amount: Math.round(Number(u.bin)).toFixed(2), currency: cur } };
+    if (u.auction != null) pricing.auction = { start_price: { amount: Math.round(Number(u.auction)).toFixed(2), currency: cur } };
     if (!Object.keys(pricing).length) continue;
     if (!byProduct.has(m.product_id)) byProduct.set(m.product_id, []);
     byProduct.get(m.product_id).push({ id: u.id, pricing });

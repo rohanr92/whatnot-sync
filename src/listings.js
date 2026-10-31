@@ -127,12 +127,14 @@ export async function createListing(d) {
     if (!dv) { warnings.push(`No Shopify variant for ${wv.selected_options?.map((o) => o.value).join('/')}`); continue; }
     const cur = 'USD';
     const pricing = {};
-    if (Number(dv.bin) > 0) pricing.buy_it_now = { price: { amount: Number(dv.bin).toFixed(2), currency: cur } };
-    if (Number(dv.auction) > 0) pricing.auction = { start_price: { amount: Number(dv.auction).toFixed(2), currency: cur } };
+    if (Number(dv.bin) > 0) pricing.buy_it_now = { price: { amount: Math.round(Number(dv.bin)).toFixed(2), currency: cur } };
+    if (Number(dv.auction) > 0) pricing.auction = { start_price: { amount: Math.round(Number(dv.auction)).toFixed(2), currency: cur } };
     patches.push({ id: wv.id, sku: dv.sku || undefined, external_id: shopify.numId(dv.shopify_variant_id), pricing });
     qtys.push({ variant_id: wv.id, quantity: dv.qty || 0, sku: dv.sku });
   }
-  const pr = await wn.patchVariants(pid, patches);
+  let pr;
+  try { pr = await wn.patchVariants(pid, patches); }
+  catch (e) { await wn.deleteProduct(pid).catch(() => {}); throw e; } // undo, so a retry doesn't make a duplicate
   pr.errors.forEach((e) => warnings.push(`Variant ${e.id}: ${e.message || e.code}`));
   if (qtys.length) await wn.setInventory(qtys);
 
@@ -205,8 +207,8 @@ export async function updateFromShopify(wnProductId, { prices = false, content =
     const v = { id: wv.id, sku: dv.sku || undefined, external_id: shopify.numId(dv.shopify_variant_id) };
     if (prices || (!wv.pricing?.buy_it_now && !wv.pricing?.auction)) {
       v.pricing = {};
-      if (dv.bin) v.pricing.buy_it_now = { price: { amount: dv.bin.toFixed(2), currency: 'USD' } };
-      if (dv.auction) v.pricing.auction = { start_price: { amount: dv.auction.toFixed(2), currency: 'USD' } };
+      if (dv.bin) v.pricing.buy_it_now = { price: { amount: Math.round(dv.bin).toFixed(2), currency: 'USD' } };
+      if (dv.auction) v.pricing.auction = { start_price: { amount: Math.round(dv.auction).toFixed(2), currency: 'USD' } };
     }
     patches.push(v);
   }
