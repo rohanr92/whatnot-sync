@@ -397,6 +397,5 @@ async function scheduleReconcile() {
 await migrate();
 await auth.bootstrapAdmin();
 await scheduleReconcile();
-setInterval(() => sync.quickStockCheck(), 2 * 60_000); // backup stock check every 2 minutes
 tax.loadTaxonomy().catch((e) => console.error(e.message));
 app.listen(PORT, () => console.log(`Whatnot ⇄ Shopify sync running on :${PORT}`));
