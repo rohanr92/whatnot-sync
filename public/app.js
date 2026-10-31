@@ -962,7 +962,7 @@ function draftCard(d, i, open = false) {
   return `<div class="draft" id="draft-${i}" data-i="${i}" ${open ? 'data-remount="1"' : ''}>
     <div class="draft-head">${d.media[0] ? `<img class="thumb" src="${esc(d.media[0].url)}" alt="" />` : '<div class="thumb"></div>'}
       <div><div class="t">${esc(d.title)}</div><div class="muted" style="font-size:12.5px">${esc(d.category_path || 'No category')} · ${draftSummary(d)}</div><div>${warn.join(' ')}</div></div>
-      <span class="sp"></span><label class="row" style="gap:6px;font-size:13px"><input type="checkbox" class="dinc" checked /> include</label><button class="btn sm">Edit ▾</button></div>
+      <span class="sp"></span><label class="row" style="gap:6px;font-size:13px"><input type="checkbox" class="dinc" ${d.existing_wn_product_id ? '' : 'checked'} /> include</label><button class="btn sm">Edit ▾</button></div>
     <div class="draft-body ${open ? '' : 'hidden'}">
       <label class="f"><span>Title</span><input type="text" class="dt" value="${esc(d.title)}" maxlength="200" /></label>
       <label class="f"><span>Description</span><textarea class="dd">${esc(d.description)}</textarea></label>

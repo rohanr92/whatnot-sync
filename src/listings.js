@@ -108,6 +108,14 @@ export async function createListing(d) {
   const s = await getSettings();
   const errs = validateDraft(d);
   if (errs.length) throw new Error(`Missing: ${errs.join(', ')}`);
+  const already = (await onWhatnot([d.shopify_product_id]))[d.shopify_product_id];
+  if (already) {
+    let exists = true;
+    try { await wn.allVariants(already); } catch (e) { if (e.status === 404) exists = false; }
+    if (exists) throw new Error(`Already on Whatnot (#${already}) — skipped, so no duplicate was made. Use Inventory or Products to change it.`);
+    await q('DELETE FROM wn_variants WHERE product_id=$1', [already]); // was deleted on Whatnot: forget it
+    await q('DELETE FROM wn_products WHERE id=$1', [already]);
+  }
   const warnings = [];
   const body = {
     title: d.title.trim(), description: d.description || null, category: { id: String(d.category_id) },
@@ -331,7 +339,7 @@ export async function deleteProducts(ids) {
   let ok = 0; const errors = [];
   for (const id of ids) {
     try {
-      await wn.deleteProduct(id);
+      try { await wn.deleteProduct(id); } catch (e) { if (e.status !== 404) throw e; } // 404 = already gone on Whatnot
       await q('DELETE FROM wn_variants WHERE product_id=$1', [id]);
       await q('DELETE FROM wn_products WHERE id=$1', [id]);
       ok++;
