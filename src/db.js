@@ -46,6 +46,7 @@ export async function migrate() {
   ALTER TABLE shop_variants ADD COLUMN IF NOT EXISTS product_id TEXT;
   ALTER TABLE wn_products ADD COLUMN IF NOT EXISTS category_id TEXT;
   ALTER TABLE wn_products ADD COLUMN IF NOT EXISTS category_label TEXT;
+  ALTER TABLE links ADD COLUMN IF NOT EXISTS synced_price NUMERIC;
   `);
 }
 

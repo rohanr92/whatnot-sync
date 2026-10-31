@@ -173,14 +173,10 @@ export async function onShopifyInventory(topic, body) {
 
 export async function onShopifyProduct(body) {
   const s = await getSettings();
-  const changed = []; const priceChanged = [];
+  const changed = [];
   for (const v of body.variants || []) {
     const id = v.admin_graphql_api_id || shopify.gid('ProductVariant', v.id);
     const pid = body.admin_graphql_api_id || shopify.gid('Product', body.id);
-    const { rows: [old] } = await q('SELECT price FROM shop_variants WHERE id=$1', [id]);
-    if (old && v.price != null && Number(old.price) !== Number(v.price)) {
-      priceChanged.push({ id, base: Number(s.price_source === 'compare_at' ? v.compare_at_price || v.price : v.price) });
-    }
     const r = await q(`UPDATE shop_variants SET sku=$2, barcode=$3, price=$4, title=$5, product_title=$6, inventory_item_id=$7, product_id=$8 WHERE id=$1`,
       [id, v.sku || null, v.barcode || null, v.price ?? null, v.title, body.title, String(v.inventory_item_id), pid]);
     if (!r.rowCount && s.location_id) {
@@ -195,20 +191,40 @@ export async function onShopifyProduct(body) {
     const ids = await wnIdsForShop(changed);
     if (ids.length) await pushInventory({ wnIds: ids, reason: 'Shopify product update' });
   }
-  // Shopify price changed -> Whatnot Buy it now price (whole dollars, markup applied, auction price kept)
-  if (s.price_sync !== false && priceChanged.length) {
-    const { rows } = await q(`SELECT w.id, w.auction_price, l.shop_variant_id FROM wn_variants w JOIN links l ON l.wn_variant_id=w.id
-        WHERE l.shop_variant_id = ANY($1)`, [priceChanged.map((x) => x.id)]);
-    const ups = rows.map((r) => {
-      const base = priceChanged.find((x) => x.id === r.shop_variant_id).base;
-      const bin = Math.round(base * (1 + (Number(s.price_markup_pct) || 0) / 100));
-      return bin > 0 ? { id: r.id, bin, auction: r.auction_price != null ? Number(r.auction_price) : null } : null;
-    }).filter(Boolean);
-    if (ups.length) {
-      const res = await applyPrices(ups);
-      await log(res.errors.length ? 'warn' : 'info', 'prices', `Shopify price change "${body.title}" → Whatnot Buy it now updated on ${res.updated} sizes`);
-    }
+  // Shopify price -> Whatnot Buy it now: re-read this product's prices from Shopify (webhook payloads can be partial)
+  if (s.price_sync !== false && body.id) {
+    try {
+      const p = await shopify.getProduct(body.admin_graphql_api_id || body.id, s.location_id);
+      for (const v of p?.variants || []) await q('UPDATE shop_variants SET price=$2 WHERE id=$1', [v.id, v.price]);
+      const r = await syncPrices((p?.variants || []).map((v) => v.id));
+      if (r.updated) await log('info', 'prices', `Shopify price change "${body.title}" → Whatnot Buy it now updated on ${r.updated} sizes`);
+    } catch (e) { await log('warn', 'prices', `Price sync for "${body.title}": ${e.message}`); }
   }
+}
+
+// Shopify price -> Whatnot Buy it now (whole dollars, markup added, auction price kept).
+// Acts only when a Shopify price differs from the last one synced; the first run lines everything up once.
+// A price you change by hand in this app stays until that Shopify price changes again.
+export async function syncPrices(shopVariantIds = null) {
+  const s = await getSettings();
+  if (s.price_sync === false) return { updated: 0, checked: 0 };
+  const mult = 1 + (Number(s.price_markup_pct) || 0) / 100;
+  const only = shopVariantIds ? 'AND sv.id = ANY($1)' : '';
+  const { rows } = await q(`SELECT w.id, w.bin_price, w.auction_price, sv.price, l.synced_price
+      FROM links l JOIN wn_variants w ON w.id=l.wn_variant_id JOIN shop_variants sv ON sv.id=l.shop_variant_id
+      WHERE sv.price IS NOT NULL ${only}`, shopVariantIds ? [shopVariantIds] : []);
+  const ups = [];
+  for (const r of rows) {
+    if (r.synced_price != null && Number(r.synced_price) === Number(r.price)) continue;
+    const bin = Math.round(Number(r.price) * mult);
+    if (bin > 0 && Number(r.bin_price) !== bin) ups.push({ id: r.id, bin, auction: r.auction_price != null ? Number(r.auction_price) : null });
+  }
+  const res = ups.length ? await applyPrices(ups) : { updated: 0, errors: [] };
+  // remember the Shopify price for every size whose Whatnot price now matches it (failed ones retry next time)
+  await q(`UPDATE links l SET synced_price=sv.price FROM shop_variants sv, wn_variants w
+      WHERE sv.id=l.shop_variant_id AND w.id=l.wn_variant_id AND sv.price IS NOT NULL
+        AND w.bin_price = ROUND(sv.price * $${shopVariantIds ? 2 : 1}) ${only}`, shopVariantIds ? [shopVariantIds, mult] : [mult]);
+  return { updated: res.updated, checked: rows.length, errors: res.errors };
 }
 
 // ---------- Whatnot product webhooks ----------
@@ -517,6 +533,8 @@ export async function fullSync(progress = () => {}) {
   const s = await getSettings();
   let push = { skipped: 'push disabled' };
   if (s.push_enabled) { progress('Pushing inventory…'); push = await pushInventory({ reason: 'full sync' }); }
+  let prices = null;
+  try { prices = await syncPrices(); if (prices.updated) await log('info', 'prices', `Safety re-check: Whatnot Buy it now updated on ${prices.updated} sizes to match Shopify`); } catch (e) { prices = { error: e.message }; }
   let orders = null;
   try { orders = await pollOrders(); } catch (e) { orders = { error: e.message }; }
   await log('info', 'sync', `Full sync: Shopify ${shop.variants} variants, Whatnot ${wv.variants} variants, matched ${link.matched}, pushed ${push.pushed ?? 0}`);
