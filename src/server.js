@@ -29,6 +29,7 @@ app.post('/webhooks/shopify', raw, async (req, res) => {
   try {
     if (!(await firstTime(`s:${id}`, 'shopify'))) return;
     const body = JSON.parse(req.body.toString('utf8'));
+    await log('info', 'webhook', `Shopify ${topic} received`);
     if (topic?.startsWith('inventory_levels/')) await sync.onShopifyInventory(topic, body);
     else if (topic === 'products/update') await sync.onShopifyProduct(body);
     else if (topic?.startsWith('fulfillments/')) await sync.onShopifyFulfillment(body);
@@ -396,5 +397,6 @@ async function scheduleReconcile() {
 await migrate();
 await auth.bootstrapAdmin();
 await scheduleReconcile();
+setInterval(() => sync.quickStockCheck(), 2 * 60_000); // backup stock check every 2 minutes
 tax.loadTaxonomy().catch((e) => console.error(e.message));
 app.listen(PORT, () => console.log(`Whatnot ⇄ Shopify sync running on :${PORT}`));

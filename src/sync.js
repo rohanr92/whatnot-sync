@@ -161,7 +161,10 @@ async function wnIdsForShop(shopVariantIds) {
 
 export async function onShopifyInventory(topic, body) {
   const s = await getSettings();
-  if (!s.location_id || String(body.location_id) !== shopify.numId(s.location_id)) return; // other location: ignore
+  if (!s.location_id || String(body.location_id) !== shopify.numId(s.location_id)) { // other location: ignore
+    await log('info', 'webhook', `Shopify stock change at another location (${body.location_id}) ignored — only ${s.location_name || 'the chosen location'} is synced`);
+    return;
+  }
   const itemId = String(body.inventory_item_id);
   if (topic === 'inventory_levels/disconnect') await q('UPDATE shop_variants SET stocked=false, qty=NULL WHERE inventory_item_id=$1', [itemId]);
   else await q('UPDATE shop_variants SET stocked=true, qty=$2 WHERE inventory_item_id=$1', [itemId, body.available ?? 0]);
@@ -408,6 +411,28 @@ export async function importOrder(orderId, { force = false } = {}) {
     await log('error', 'orders', `Whatnot order ${orderId}: ${e.message}`);
     throw e;
   }
+}
+
+// Backup for missed webhooks: every 2 minutes re-read stock at the chosen location for all matched items, push differences.
+let quickBusy = false;
+export async function quickStockCheck() {
+  if (quickBusy) return; quickBusy = true;
+  try {
+    const s = await getSettings();
+    if (!s.location_id || !s.push_enabled) return;
+    const { rows } = await q(`SELECT DISTINCT sv.inventory_item_id FROM links l JOIN shop_variants sv ON sv.id=l.shop_variant_id WHERE sv.inventory_item_id IS NOT NULL`);
+    const ids = rows.map((r) => r.inventory_item_id);
+    let changed = 0;
+    for (let i = 0; i < ids.length; i += 100) {
+      const lv = await shopify.levelsFor(ids.slice(i, i + 100), s.location_id);
+      for (const l of lv) {
+        const r = await q('UPDATE shop_variants SET qty=$2, stocked=$3 WHERE inventory_item_id=$1 AND (qty IS DISTINCT FROM $2 OR stocked IS DISTINCT FROM $3)', [shopify.numId(l.inventory_item_id), l.qty, l.stocked]);
+        changed += r.rowCount;
+      }
+    }
+    if (changed) await pushInventory({ reason: `stock check (${changed} changed in Shopify)` });
+  } catch (e) { await log('warn', 'inventory', `Stock check: ${e.message}`); }
+  finally { quickBusy = false; }
 }
 
 async function refreshLevelsAndPush(inventoryItemIds, reason) {
