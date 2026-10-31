@@ -885,6 +885,10 @@ async function renderDrafts() {
       <label class="f"><span>Category for all</span>${catPicker('allcat')}</label>
       <label class="f"><span>Sell as (all)</span><select id="allsf"><option value="">Keep each</option><option value="buy_it_now">Buy it now</option><option value="auction">Auction</option></select></label>
     </div>
+    <div class="row" style="margin-bottom:12px;gap:8px"><b style="font-size:14px">Price for all ${ds.length}:</b>
+      <input type="number" step="0.01" id="allbin" placeholder="Buy it now $" style="width:140px" />
+      <input type="number" step="0.01" id="allauc" placeholder="Auction start $" style="width:150px" />
+      <button class="btn" id="allset" type="button">Apply to all</button></div>
     <div class="row"><label class="switch" style="margin:0"><input type="checkbox" id="allpub" /> Publish all to my Whatnot shop</label><span style="flex:1"></span>
       <button class="btn primary" id="dcreate">Create ${ds.length} on Whatnot</button></div></div>
     <div id="drafts">${ds.map((d, i) => draftCard(d, i)).join('')}</div><div id="dres"></div>`;
@@ -900,6 +904,13 @@ async function renderDrafts() {
   });
   $('#allsf').onchange = (e) => { if (!e.target.value) return; document.querySelectorAll('[data-sf]').forEach((x) => { x.value = e.target.value; }); };
   $('#allpub').onchange = (e) => document.querySelectorAll('[data-pub]').forEach((x) => { x.checked = e.target.checked; });
+  $('#allset').onclick = () => {
+    const b = $('#allbin').value, a = $('#allauc').value;
+    if (!b && !a) return toast('Type a Buy it now or Auction price first', 'bad');
+    if (b) document.querySelectorAll('.vbin').forEach((x) => { x.value = Number(b).toFixed(2); });
+    if (a) document.querySelectorAll('.vauc').forEach((x) => { x.value = Number(a).toFixed(2); });
+    toast(`Price set on every size of all ${imp.drafts.length} listings`, 'ok');
+  };
   ds.forEach((_, i) => mountCatPicker(`dcat${i}`, onDraftCat(i)));
   ds.forEach((_, i) => bindDraft(i));
   $('#dcreate').onclick = createDrafts;
@@ -974,7 +985,7 @@ async function createDrafts() {
   const all = collectDrafts(); const drafts = all.filter((d) => d.include);
   if (!drafts.length) return toast('Nothing included', 'bad');
   const problems = drafts.filter((d) => !d.category_id || (d.sale_format === 'auction' ? d.variants.some((v) => !v.auction) : d.variants.some((v) => !v.bin)));
-  if (problems.length) return toast(`${problems.length} listing(s) need a category and a ${'price on every variant'} for the chosen sale format`, 'bad');
+  if (problems.length) return toast(`${problems.length} listing(s) can't be created yet: ` + problems.slice(0, 3).map((d) => `${d.title} (${!d.category_id ? 'no category' : d.sale_format === 'auction' ? 'needs an Auction start price' : 'needs a Buy it now price'})`).join('; ') + (problems.length > 3 ? '…' : '') + ' — use "Price for all" at the top.', 'bad');
   $('#dcreate').disabled = true;
   try {
     await api('/import/create', { method: 'POST', body: { drafts } });
