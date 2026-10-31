@@ -198,9 +198,12 @@ export async function registerWebhooks(appUrl) {
 }
 
 export function verifyWebhook(rawBody, hmacHeader) {
-  const secret = process.env.SHOPIFY_WEBHOOK_SECRET || process.env.SHOPIFY_CLIENT_SECRET || process.env.SHOPIFY_API_SECRET;
-  if (!secret || !hmacHeader) return false;
-  const digest = crypto.createHmac('sha256', secret).update(rawBody).digest();
+  // accept webhooks signed by the app (API secret key) OR created in Shopify admin (Notifications > Webhooks signing secret)
+  const secrets = [process.env.SHOPIFY_WEBHOOK_SECRET, process.env.SHOPIFY_API_SECRET, process.env.SHOPIFY_CLIENT_SECRET].filter(Boolean);
+  if (!secrets.length || !hmacHeader) return false;
   const given = Buffer.from(hmacHeader, 'base64');
-  return given.length === digest.length && crypto.timingSafeEqual(digest, given);
+  return secrets.some((sec) => {
+    const digest = crypto.createHmac('sha256', sec.trim()).update(rawBody).digest();
+    return given.length === digest.length && crypto.timingSafeEqual(digest, given);
+  });
 }
